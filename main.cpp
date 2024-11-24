@@ -178,7 +178,7 @@ int main() {
     JoinGraph graph;
     std::vector<std::string> queries = {
         "SELECT DISTINCT value FROM table_a WHERE value > 3",
-        "SELECT DISTINCT value FROM table_b WHERE value < 4",
+        // "SELECT DISTINCT value FROM table_b WHERE value < 4",
     };
 
     // Build sketches from custom queries
