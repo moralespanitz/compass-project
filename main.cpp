@@ -9,7 +9,7 @@
 #include <random>
 #include <algorithm>
 #include <string>
-
+#include <regex>
 // FastAGMSSketch class remains the same
 class FastAGMSSketch {
 private:
@@ -217,7 +217,7 @@ std::string buildJoinPlan(const JoinGraph &graph) {
             joinCond = " [" + graph.joinConditions.at(key)[0] + "]";
         }
 
-        std::string newResult = "(" + left + " ⨝" + joinCond + " " + right + ")";
+        std::string newResult = "(" + left + " JOIN" + joinCond + " " + right + ")";
         joinPlan = newResult;
 
         // Update dependencies
@@ -237,6 +237,84 @@ std::string buildJoinPlan(const JoinGraph &graph) {
 
     return joinPlan;
 }
+class JoinPlanParser {
+private:
+    std::unordered_map<std::string, std::string> aliasToTable = {
+        {"T", "title"},
+        {"MC", "movie_companies"},
+        {"CT", "company_type"},
+        {"MI_IDX", "movie_info_idx"},
+        {"IT", "info_type"}
+    };
+
+    std::string cleanExpression(std::string expr) {
+        // Remove join conditions within square brackets
+        expr = std::regex_replace(expr, std::regex(R"(\[.*?\])"), "");
+        
+        // Replace aliases with actual table names
+        for (const auto& [alias, table] : aliasToTable) {
+            std::regex aliasRegex("\\b" + alias + "\\b");
+            expr = std::regex_replace(expr, aliasRegex, table);
+        }
+        
+        // Remove extra spaces
+        expr = std::regex_replace(expr, std::regex(R"(\s+)"), " ");
+        return expr;
+    }
+
+    std::string parseNestedJoins(std::string expr) {
+        // Trim whitespace
+        expr = std::regex_replace(expr, std::regex("^\\s+|\\s+$"), "");
+        
+        // Remove outer parentheses if they exist
+        if (expr.front() == '(' && expr.back() == ')') {
+            expr = expr.substr(1, expr.length() - 2);
+        }
+
+        // Find the join symbol 'JOIN'
+        size_t joinPos = expr.find(" JOIN ");
+        if (joinPos == std::string::npos) {
+            // Base case: single table
+            return cleanExpression(expr);
+        }
+
+        // Split into left and right parts
+        std::string leftPart = expr.substr(0, joinPos);
+        std::string rightPart = expr.substr(joinPos + 6);
+
+        // Clean and parse both parts
+        std::string leftParsed = parseNestedJoins(leftPart);
+        std::string rightParsed = parseNestedJoins(rightPart);
+
+        // Construct the result in the desired format
+        return "(" + rightParsed + " ⨝ " + leftParsed + ")";
+    }
+
+    std::string cleanupParentheses(std::string expr) {
+        // Clean up any remaining double parentheses
+        std::string result = expr;
+        while (result.find("((") != std::string::npos || result.find("))") != std::string::npos) {
+            result = std::regex_replace(result, std::regex("\\(\\("), "(");
+            result = std::regex_replace(result, std::regex("\\)\\)"), ")");
+        }
+        return result;
+    }
+
+public:
+    void setAliasMap(const std::unordered_map<std::string, std::string>& aliasMap) {
+        aliasToTable.clear();
+        for (const auto& [alias, table] : aliasMap) {
+            std::string upperAlias = alias;
+            std::transform(upperAlias.begin(), upperAlias.end(), upperAlias.begin(), ::toupper);
+            aliasToTable[upperAlias] = table;
+        }
+    }
+
+    std::string parse(const std::string& inputPlan) {
+        std::string result = parseNestedJoins(inputPlan);
+        return cleanupParentheses(result);
+    }
+};
 
 int main() {
     const char* conninfo = "dbname=job user=postgres password=postgres hostaddr=127.0.0.1 port=5432";
@@ -335,6 +413,12 @@ int main() {
     std::string joinPlan = buildJoinPlan(graph);
     std::cout << "\nOptimal Join Plan: " << joinPlan << std::endl;
 
+    // Parse the join plan into the desired format
+    JoinPlanParser parser;
+    parser.setAliasMap(aliasMap);
+    std::string parsedPlan = parser.parse(joinPlan);
+    std::cout << "\nParsed Join Plan: " << parsedPlan << std::endl;
+    
     PQfinish(conn);
     return 0;
 }
