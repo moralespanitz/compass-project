@@ -251,24 +251,10 @@ int main() {
 
     // Define the alias mapping (alias -> actual table name)
     std::unordered_map<std::string, std::string> aliasMap = {
-        {"ak", "aka_name"},
-        {"an", "aka_title"},
-        {"cct", "cast_info"},
-        {"ch", "char_name"},
-        {"ci", "cast_info"},
-        {"cn", "company_name"},
         {"ct", "company_type"},
         {"it", "info_type"},
-        {"k", "keyword"},
-        {"lt", "link_type"},
         {"mc", "movie_companies"},
-        {"mi", "movie_info"},
         {"mi_idx", "movie_info_idx"},
-        {"mk", "movie_keyword"},
-        {"ml", "movie_link"},
-        {"n", "name"},
-        {"pi", "person_info"},
-        {"rt", "role_type"},
         {"t", "title"}
     };
 
