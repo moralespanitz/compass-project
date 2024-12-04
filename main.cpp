@@ -1,349 +1,261 @@
-#include <algorithm>
-#include <functional>
-#include <iostream>
-#include <libpq-fe.h>
-#include <queue>
-#include <random>
-#include <sstream>
 #include <string>
+#include <vector>
+#include <iostream>
 #include <unordered_map>
 #include <unordered_set>
-#include <vector>
-
-// FastAGMSSketch class remains the same
-class FastAGMSSketch {
+#include <queue>
+#include <memory>
+#include <stdexcept>
+#include <algorithm>
+#include <sstream>
+class JoinPlanGenerator {
 private:
-  std::vector<std::vector<int>> sketch;
-  std::hash<int> hashFunc;
-  int rows, cols;
+    std::unordered_map<std::string, std::string> aliasToTable;
+    
+    struct JoinInfo {
+        std::vector<std::string> tables;
+        std::vector<std::string> joinConditions;
+        std::unordered_map<std::string, std::vector<std::string>> tableJoins;
+    };
 
-  int hash(int value, int seed) const {
-    std::mt19937 rng(seed);
-    rng.seed(seed);
-    return (value ^ rng()) % cols;
-  }
-
+    void parseAliases(const std::string& query) {
+        size_t fromPos = query.find("FROM");
+        size_t wherePos = query.find("WHERE");
+        if (fromPos == std::string::npos) return;
+        
+        std::string fromClause = query.substr(fromPos + 4, 
+            wherePos != std::string::npos ? wherePos - (fromPos + 4) : std::string::npos);
+        
+        std::istringstream iss(fromClause);
+        std::string token;
+        std::string table;
+        bool expectingAlias = false;
+        
+        while (iss >> token) {
+            // Remove commas
+            if (!token.empty() && token.back() == ',') {
+                token.pop_back();
+            }
+            
+            if (token == "AS") {
+                expectingAlias = true;
+                continue;
+            }
+            
+            if (expectingAlias) {
+                aliasToTable[token] = table;
+                expectingAlias = false;
+                table.clear();
+            } else {
+                table = token;
+            }
+        }
+    }
+    
+    JoinInfo parseJoinConditions(const std::string& query) {
+        JoinInfo info;
+        size_t wherePos = query.find("WHERE");
+        if (wherePos == std::string::npos) return info;
+        
+        std::string whereClause = query.substr(wherePos + 5);
+        std::vector<std::string> conditions;
+        
+        // Split by AND, properly handling whitespace
+        size_t start = 0;
+        while (start < whereClause.length()) {
+            size_t andPos = whereClause.find("AND", start);
+            if (andPos == std::string::npos) {
+                conditions.push_back(trim(whereClause.substr(start)));
+                break;
+            }
+            
+            std::string condition = trim(whereClause.substr(start, andPos - start));
+            if (!condition.empty()) {
+                conditions.push_back(condition);
+            }
+            start = andPos + 3;
+        }
+        
+        // Process each condition
+        for (const auto& condition : conditions) {
+            if (condition.find('=') != std::string::npos && condition.find('.') != std::string::npos) {
+                auto tables = extractTablesFromJoin(condition);
+                if (!tables.first.empty() && !tables.second.empty()) {
+                    // Convert aliases to table names
+                    std::string table1 = aliasToTable[tables.first];
+                    std::string table2 = aliasToTable[tables.second];
+                    
+                    info.joinConditions.push_back(condition);
+                    info.tableJoins[table1].push_back(table2);
+                    info.tableJoins[table2].push_back(table1);
+                    
+                    if (std::find(info.tables.begin(), info.tables.end(), table1) == info.tables.end()) {
+                        info.tables.push_back(table1);
+                    }
+                    if (std::find(info.tables.begin(), info.tables.end(), table2) == info.tables.end()) {
+                        info.tables.push_back(table2);
+                    }
+                }
+            }
+        }
+        return info;
+    }
+    
+    std::pair<std::string, std::string> extractTablesFromJoin(const std::string& condition) {
+        size_t eqPos = condition.find('=');
+        if (eqPos == std::string::npos) return {"", ""};
+        
+        std::string left = trim(condition.substr(0, eqPos));
+        std::string right = trim(condition.substr(eqPos + 1));
+        
+        size_t dotPosLeft = left.find('.');
+        size_t dotPosRight = right.find('.');
+        
+        if (dotPosLeft == std::string::npos || dotPosRight == std::string::npos) 
+            return {"", ""};
+            
+        return {
+            trim(left.substr(0, dotPosLeft)),
+            trim(right.substr(0, dotPosRight))
+        };
+    }
+    
+    std::string trim(const std::string& str) {
+        size_t first = str.find_first_not_of(" \t\n\r");
+        if (first == std::string::npos) return "";
+        size_t last = str.find_last_not_of(" \t\n\r");
+        return str.substr(first, last - first + 1);
+    }
+    
+    std::string generateOptimalPlan(const JoinInfo& info) {
+        if (info.tables.empty()) return "";
+        
+        std::unordered_set<std::string> used;
+        std::string plan = info.tables[0];
+        used.insert(info.tables[0]);
+        
+        while (used.size() < info.tables.size()) {
+            std::string bestTable;
+            int maxConnections = -1;
+            
+            for (const auto& table : info.tables) {
+                if (used.find(table) != used.end()) continue;
+                
+                int connections = 0;
+                for (const auto& joinTable : info.tableJoins.at(table)) {
+                    if (used.find(joinTable) != used.end()) {
+                        connections++;
+                    }
+                }
+                
+                if (connections > maxConnections) {
+                    maxConnections = connections;
+                    bestTable = table;
+                }
+            }
+            
+            if (bestTable.empty()) break;
+            plan = "(" + plan + " ⨝ " + bestTable + ")";
+            used.insert(bestTable);
+        }
+        
+        return plan;
+    }
+    std::string generatePostgresStylePlan(const JoinInfo& info) {
+        if (info.tables.empty()) return "";
+        
+        // Calculate join counts for each table
+        std::unordered_map<std::string, int> joinCount;
+        for (const auto& [table, joins] : info.tableJoins) {
+            joinCount[table] = joins.size();
+        }
+        
+        // Start with the table that has the most joins
+        std::string mostJoinedTable;
+        int maxJoins = -1;
+        for (const auto& [table, count] : joinCount) {
+            if (count > maxJoins) {
+                maxJoins = count;
+                mostJoinedTable = table;
+            }
+        }
+        
+        // Build the join plan from inside out
+        std::unordered_set<std::string> used;
+        std::string plan = mostJoinedTable;
+        used.insert(mostJoinedTable);
+        
+        while (used.size() < info.tables.size()) {
+            std::string nextTable;
+            int maxConnections = -1;
+            
+            // Find table with most connections to already used tables
+            for (const auto& table : info.tables) {
+                if (used.find(table) != used.end()) continue;
+                
+                int connections = 0;
+                for (const auto& joinTable : info.tableJoins.at(table)) {
+                    if (used.find(joinTable) != used.end()) {
+                        connections++;
+                    }
+                }
+                
+                // Prefer tables with higher join count when connections are equal
+                if (connections > maxConnections || 
+                    (connections == maxConnections && joinCount[table] > joinCount[nextTable])) {
+                    maxConnections = connections;
+                    nextTable = table;
+                }
+            }
+            
+            if (nextTable.empty()) break;
+            
+            // Wrap previous plan in parentheses and add new table
+            plan = "(" + nextTable + " ⨝ " + plan + ")";
+            used.insert(nextTable);
+        }
+        
+        return plan;
+    }
 public:
-  FastAGMSSketch() : rows(0), cols(0), sketch(0, std::vector<int>(0, 0)) {}
-
-  FastAGMSSketch(int rows, int cols)
-      : rows(rows), cols(cols), sketch(rows, std::vector<int>(cols, 0)) {}
-
-  void update(int value) {
-    for (int i = 0; i < rows; ++i) {
-      int col = hash(value, i);
-      sketch[i][col] += (value > 0 ? 1 : -1);
+    std::string getOptimalJoinPlan(const std::string& query) {
+        aliasToTable.clear();
+        parseAliases(query);
+        JoinInfo joinInfo = parseJoinConditions(query);
+        return generatePostgresStylePlan(joinInfo);
     }
-  }
-
-  int dotProduct(const FastAGMSSketch &other) const {
-    if (rows != other.rows || cols != other.cols) {
-      throw std::invalid_argument("Sketch dimensions do not match.");
-    }
-
-    int result = 0;
-    for (int i = 0; i < rows; ++i) {
-      for (int j = 0; j < cols; ++j) {
-        result += sketch[i][j] * other.sketch[i][j];
-      }
-    }
-    return result;
-  }
-
-  FastAGMSSketch merge(const FastAGMSSketch &other) const {
-    if (rows != other.rows || cols != other.cols) {
-      throw std::invalid_argument("Sketch dimensions do not match.");
-    }
-
-    FastAGMSSketch merged(rows, cols);
-    for (int i = 0; i < rows; ++i) {
-      for (int j = 0; j < cols; ++j) {
-        merged.sketch[i][j] =
-            std::min(std::abs(sketch[i][j]), std::abs(other.sketch[i][j]));
-      }
-    }
-    return merged;
-  }
 };
 
-// Enhanced query analysis structure with alias support
-struct TableAlias {
-  std::string table;
-  std::string alias;
-};
-struct QueryInfo {
-  std::vector<std::string> tables;
-  std::vector<std::string> joinConditions;
-  std::vector<std::string> whereConditions;
-  std::unordered_map<std::string, std::string>
-      aliasToTable; // Maps alias to actual table name
-  std::unordered_map<std::string, std::string>
-      tableToAlias; // Maps actual table name to alias
-};
-
-QueryInfo
-analyzeQuery(const std::string &query,
-             const std::unordered_map<std::string, std::string> &aliasMap) {
-  QueryInfo info;
-  std::string upperQuery = query;
-  std::transform(upperQuery.begin(), upperQuery.end(), upperQuery.begin(),
-                 ::toupper);
-
-  // Create reverse mapping
-  for (const auto &[alias, table] : aliasMap) {
-    std::string upperAlias = alias;
-    std::string upperTable = table;
-    std::transform(upperAlias.begin(), upperAlias.end(), upperAlias.begin(),
-                   ::toupper);
-    std::transform(upperTable.begin(), upperTable.end(), upperTable.begin(),
-                   ::toupper);
-    info.aliasToTable[upperAlias] = upperTable;
-    info.tableToAlias[upperTable] = upperAlias;
-  }
-
-  // Extract tables
-  size_t fromPos = upperQuery.find("FROM");
-  size_t wherePos = upperQuery.find("WHERE");
-  if (fromPos != std::string::npos) {
-    std::string tableSection = upperQuery.substr(
-        fromPos + 4, wherePos != std::string::npos ? wherePos - (fromPos + 4)
-                                                   : std::string::npos);
-
-    std::istringstream iss(tableSection);
-    std::string token;
-    while (iss >> token) {
-      if (token != "," && token != "JOIN" && token != "AS") {
-        token.erase(std::remove(token.begin(), token.end(), ','), token.end());
-        if (!token.empty() &&
-            info.aliasToTable.find(token) != info.aliasToTable.end()) {
-          info.tables.push_back(info.aliasToTable[token]);
-        }
-      }
-    }
-  }
-
-  // Extract join conditions
-  if (wherePos != std::string::npos) {
-    std::string whereSection = upperQuery.substr(wherePos + 5);
-    size_t pos = 0;
-    while ((pos = whereSection.find(" AND ")) != std::string::npos) {
-      std::string condition = whereSection.substr(0, pos);
-      condition.erase(0, condition.find_first_not_of(" \n\r\t"));
-      condition.erase(condition.find_last_not_of(" \n\r\t") + 1);
-
-      if (condition.find('=') != std::string::npos &&
-          condition.find('.') != std::string::npos) {
-        info.joinConditions.push_back(condition);
-      } else {
-        info.whereConditions.push_back(condition);
-      }
-      whereSection = whereSection.substr(pos + 5);
-    }
-
-    whereSection.erase(0, whereSection.find_first_not_of(" \n\r\t"));
-    whereSection.erase(whereSection.find_last_not_of(" \n\r\t") + 1);
-    if (!whereSection.empty()) {
-      if (whereSection.find('=') != std::string::npos &&
-          whereSection.find('.') != std::string::npos) {
-        info.joinConditions.push_back(whereSection);
-      } else {
-        info.whereConditions.push_back(whereSection);
-      }
-    }
-  }
-
-  return info;
+std::string getOptimalPlan(const std::string& input_query) {
+    JoinPlanGenerator generator;
+    return generator.getOptimalJoinPlan(input_query);
 }
-
-FastAGMSSketch buildSketchFromQuery(PGconn *conn, const std::string &tableName,
-                                    int rows, int cols) {
-  FastAGMSSketch sketch(rows, cols);
-  std::string query = "SELECT id FROM " + tableName + " LIMIT 1000";
-
-  PGresult *res = PQexec(conn, query.c_str());
-
-  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-    std::cerr << "Query failed: " << PQerrorMessage(conn) << std::endl;
-    PQclear(res);
-    throw std::runtime_error("Failed to execute query.");
-  }
-
-  int nRows = PQntuples(res);
-  for (int i = 0; i < nRows; ++i) {
-    int value = std::stoi(PQgetvalue(res, i, 0));
-    sketch.update(value);
-  }
-
-  PQclear(res);
-  return sketch;
-}
-
-struct JoinGraph {
-  std::unordered_map<std::string, FastAGMSSketch> tableSketches;
-  std::vector<std::pair<std::string, std::string>> joins;
-  std::unordered_map<std::string, std::vector<std::string>> joinConditions;
-};
-
-std::string buildJoinPlan(const JoinGraph &graph) {
-  std::unordered_map<std::string, std::string> resultNames;
-  std::unordered_set<std::string> joinedTables;
-  std::unordered_map<std::string, std::unordered_set<std::string>> dependencies;
-
-  auto cmp = [&graph](const std::pair<std::string, std::string> &a,
-                      const std::pair<std::string, std::string> &b) {
-    FastAGMSSketch mergedA =
-        graph.tableSketches.at(a.first).merge(graph.tableSketches.at(a.second));
-    FastAGMSSketch mergedB =
-        graph.tableSketches.at(b.first).merge(graph.tableSketches.at(b.second));
-    return mergedA.dotProduct(graph.tableSketches.at(a.first)) >
-           mergedB.dotProduct(graph.tableSketches.at(b.first));
-  };
-
-  std::priority_queue<std::pair<std::string, std::string>,
-                      std::vector<std::pair<std::string, std::string>>,
-                      decltype(cmp)>
-      pq(cmp);
-
-  for (const auto &join : graph.joins) {
-    pq.push(join);
-  }
-
-  std::string joinPlan;
-  while (!pq.empty()) {
-    auto [tableA, tableB] = pq.top();
-    pq.pop();
-
-    // Skip if both tables are already in the same join group
-    if (!dependencies[tableA].empty() && !dependencies[tableB].empty() &&
-        dependencies[tableA] == dependencies[tableB]) {
-      continue;
-    }
-
-    std::string left = resultNames.count(tableA) ? resultNames[tableA] : tableA;
-    std::string right =
-        resultNames.count(tableB) ? resultNames[tableB] : tableB;
-
-    std::string newResult = "(" + left + " ⨝ " + right + ")";
-    joinPlan = newResult;
-
-    // Update dependencies
-    std::unordered_set<std::string> newDeps = dependencies[tableA];
-    newDeps.insert(dependencies[tableB].begin(), dependencies[tableB].end());
-    newDeps.insert(tableA);
-    newDeps.insert(tableB);
-
-    for (const auto &table : newDeps) {
-      dependencies[table] = newDeps;
-      resultNames[table] = newResult;
-    }
-
-    joinedTables.insert(tableA);
-    joinedTables.insert(tableB);
-  }
-
-  return joinPlan;
-}
-
 int main() {
-  const char *conninfo =
-      "dbname=job user=postgres password=postgres hostaddr=127.0.0.1 port=5432";
-  PGconn *conn = PQconnectdb(conninfo);
-
-  if (PQstatus(conn) != CONNECTION_OK) {
-    std::cerr << "Connection to database failed: " << PQerrorMessage(conn)
-              << std::endl;
-    PQfinish(conn);
-    return 1;
-  }
-  std::cout << "Connected to PostgreSQL!" << std::endl;
-
-  // Define the alias mapping (alias -> actual table name)
-  std::unordered_map<std::string, std::string> aliasMap = {
-      {"ct", "company_type"},
-      {"it", "info_type"},
-      {"mc", "movie_companies"},
-      {"mi_idx", "movie_info_idx"},
-      {"t", "title"}};
-
-  // Define the example query similar to JOB benchmark format
-  std::string query = R"SQL(
-  SELECT MIN(mc.note) AS production_note,
-       MIN(t.title) AS movie_title,
-       MIN(t.production_year) AS movie_year
-FROM company_type AS ct,
-     info_type AS it,
-     movie_companies AS mc,
+    std::string input_query = R"(
+   SELECT MIN(mi_idx.info) AS rating,
+       MIN(t.title) AS movie_title
+FROM info_type AS it,
+     keyword AS k,
      movie_info_idx AS mi_idx,
+     movie_keyword AS mk,
      title AS t
-WHERE ct.kind = 'production companies'
-  AND it.info = 'bottom 10 rank'
-  AND mc.note NOT LIKE '%(as Metro-Goldwyn-Mayer Pictures)%'
-  AND t.production_year >2000
-  AND ct.id = mc.company_type_id
-  AND t.id = mc.movie_id
+WHERE it.info ='rating'
+  AND k.keyword LIKE '%sequel%'
+  AND mi_idx.info > '2.0'
+  AND t.production_year > 1990
   AND t.id = mi_idx.movie_id
-  AND mc.movie_id = mi_idx.movie_id
+  AND t.id = mk.movie_id
+  AND mk.movie_id = mi_idx.movie_id
+  AND k.id = mk.keyword_id
   AND it.id = mi_idx.info_type_id;
-    )SQL";
+    )";
 
-  // Analyze the query with the alias mapping
-  QueryInfo queryInfo = analyzeQuery(query, aliasMap);
-
-  // Create the join graph
-  JoinGraph graph;
-
-  // Print table mappings for debugging
-  std::cout << "\nTable Mappings:" << std::endl;
-  for (const auto &[alias, table] : aliasMap) {
-    std::cout << "Table: " << table << " -> Alias: " << alias << std::endl;
-  }
-
-  // Build sketches using actual table names
-  for (const auto &table : queryInfo.tables) {
     try {
-      std::string alias = queryInfo.tableToAlias[table];
-      graph.tableSketches[alias] = buildSketchFromQuery(conn, table, 10, 50);
-      std::cout << "Built sketch for " << table << " (alias: " << alias << ")"
-                << std::endl;
-    } catch (const std::exception &e) {
-      std::cerr << "Error building sketch for " << table << ": " << e.what()
-                << std::endl;
-      continue;
+        std::string optimalPlan = getOptimalPlan(input_query);
+        std::cout << "Optimal Join Plan: " << optimalPlan << std::endl;
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
     }
-  }
-
-  // Add joins with proper alias mapping
-  for (const auto &join : queryInfo.joinConditions) {
-    std::istringstream iss(join);
-    std::string leftPart, equals, rightPart;
-    iss >> leftPart >> equals >> rightPart;
-
-    if (equals == "=") {
-      size_t dotPos1 = leftPart.find('.');
-      size_t dotPos2 = rightPart.find('.');
-      if (dotPos1 != std::string::npos && dotPos2 != std::string::npos) {
-        std::string alias1 = leftPart.substr(0, dotPos1);
-        std::string alias2 = rightPart.substr(0, dotPos2);
-
-        if (graph.tableSketches.count(alias1) &&
-            graph.tableSketches.count(alias2)) {
-          graph.joins.push_back({alias1, alias2});
-          graph.joinConditions[alias1 + "_" + alias2] = {join};
-        }
-      }
-    }
-  }
-
-  // Print extracted information
-  std::cout << "\nExtracted Join Conditions:" << std::endl;
-  for (const auto &join : queryInfo.joinConditions) {
-    std::cout << "- " << join << std::endl;
-  }
-
-  // Build and print the join plan
-  std::string joinPlan = buildJoinPlan(graph);
-  std::cout << "\nOptimal Join Plan: " << joinPlan << std::endl;
-
-  PQfinish(conn);
-  return 0;
 }
