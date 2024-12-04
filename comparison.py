@@ -110,7 +110,8 @@ class ComprehensiveJOBAnalysis:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
         
         join_groups = ['4-9', '10-19', '20-28']
-        
+
+
         # Cardinalidad
         compass_card = [self.performance_metrics[g]['COMPASS']['cardinality'] for g in join_groups]
         postgres_card = [self.performance_metrics[g]['PostgreSQL']['cardinality'] for g in join_groups]
